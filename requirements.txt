@@ -1,0 +1,8 @@
+langchain
+langchain-milvus
+pymilvus
+redis
+loguru
+dynaconf
+pandas
+openpyxl

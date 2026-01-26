@@ -169,10 +169,10 @@ def main():
         # demo_entity_extraction()
 
         # Demo doctor search
-        # demo_doctor_search()
+        demo_doctor_search()
 
         # Demo conversation management
-        demo_conversation_management()
+        # demo_conversation_management()
 
         print("\n=== Chat Request Demo ===")
         print("Processing full chat request...")

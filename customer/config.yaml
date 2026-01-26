@@ -36,6 +36,9 @@ default:
   ES_PORT: 9200
   ES_USER: elastic
   ES_AUTH: fh6u65tPxSa@fbcv1pM
+  # Milvus
+  MILVUS_HOST: localhost
+  MILVUS_PORT: 19530
   # search doctor
   DOCTOR_SEARCH_URL: "https://api-backend.sihuiyiliao.com/doctor_service/api/doctor/coze/doctors"
   IS_LOCAL: False
