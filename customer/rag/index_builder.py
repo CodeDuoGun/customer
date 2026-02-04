@@ -1,27 +1,32 @@
 """
-Index builder for creating LlamaIndex indices from various data sources.
+Index builder for creating LangChain documents from various data sources.
 """
 import os
 from typing import List, Dict, Any, Optional
-from llama_index.core import Document, SimpleDirectoryReader
-from llama_index.core.node_parser import SimpleNodeParser
+from langchain_core.documents import Document
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from customer.config.config import config
 from customer.utils.logger import logger
 
 
 class IndexBuilder:
-    """Builder for creating LlamaIndex indices from various data sources."""
+    """Builder for creating LangChain documents from various data sources."""
 
-    def __init__(self, embed_model=None, node_parser=None):
+    def __init__(self, embed_model=None, text_splitter=None):
         """
         Initialize index builder.
 
         Args:
             embed_model: Embedding model to use
-            node_parser: Node parser for document processing
+            text_splitter: Text splitter for document processing
         """
         self.embed_model = embed_model
-        self.node_parser = node_parser or SimpleNodeParser()
+        self.text_splitter = text_splitter or RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", "。", "！", "？", ".", "!", "?"]
+        )
 
     def build_from_directory(
         self,
@@ -50,17 +55,19 @@ class IndexBuilder:
 
             logger.info(f"Building documents from directory: {directory_path}")
 
-            # Create directory reader
-            reader_kwargs = {
-                "input_dir": directory_path,
+            # Create directory loader
+            loader_kwargs = {
+                "path": directory_path,
                 "recursive": recursive
             }
 
             if file_extensions:
-                reader_kwargs["required_exts"] = file_extensions
+                # Convert extensions to glob patterns
+                glob_patterns = [f"*.{ext}" for ext in file_extensions]
+                loader_kwargs["glob"] = glob_patterns
 
-            reader = SimpleDirectoryReader(**reader_kwargs)
-            documents = reader.load_data()
+            loader = DirectoryLoader(**loader_kwargs)
+            documents = loader.load()
 
             logger.info(f"Loaded {len(documents)} documents from directory")
             return documents
@@ -94,9 +101,9 @@ class IndexBuilder:
                 if not os.path.exists(file_path):
                     logger.warning(f"File does not exist: {file_path}")
                     continue
-
-                reader = SimpleDirectoryReader(input_files=[file_path])
-                file_documents = reader.load_data()
+                #  TODO 不同文件不同loader
+                loader = TextLoader(file_path)
+                file_documents = loader.load()
                 documents.extend(file_documents)
 
             logger.info(f"Loaded {len(documents)} documents from files")
@@ -146,7 +153,7 @@ class IndexBuilder:
 
                 # Create document
                 doc = Document(
-                    text=text,
+                    page_content=text,
                     metadata=metadata,
                     **kwargs
                 )
@@ -214,9 +221,9 @@ class IndexBuilder:
 
                 # Create document
                 doc = Document(
-                    text=text,
+                    page_content=text,
                     metadata=metadata,
-                    id_=f"doctor_{doctor.get('ID', doctor.get('id', ''))}"
+                    id=f"doctor_{doctor.get('ID', doctor.get('id', ''))}"
                 )
                 documents.append(doc)
 
@@ -267,9 +274,9 @@ class IndexBuilder:
 
                 # Create document
                 doc = Document(
-                    text=text,
+                    page_content=text,
                     metadata=metadata,
-                    id_=f"qa_{hash(question)}"
+                    id=f"qa_{hash(question)}"
                 )
                 documents.append(doc)
 
@@ -284,24 +291,25 @@ class IndexBuilder:
         self,
         documents: List[Document],
         **kwargs
-    ) -> List[Any]:
+    ) -> List[Document]:
         """
-        Process documents into nodes.
+        Process documents into chunks.
 
         Args:
             documents: List of documents to process
-            **kwargs: Additional arguments for node parser
+            **kwargs: Additional arguments for text splitter
 
         Returns:
-            List of nodes
+            List of document chunks
         """
         try:
-            logger.info(f"Processing {len(documents)} documents into nodes")
+            logger.info(f"Processing {len(documents)} documents into chunks")
 
-            nodes = self.node_parser.get_nodes_from_documents(documents, **kwargs)
+            # Split documents into chunks
+            chunks = self.text_splitter.split_documents(documents, **kwargs)
 
-            logger.info(f"Created {len(nodes)} nodes from documents")
-            return nodes
+            logger.info(f"Created {len(chunks)} chunks from documents")
+            return chunks
 
         except Exception as e:
             logger.error(f"Failed to process documents: {str(e)}")

@@ -24,12 +24,12 @@
 """
 import requests
 from typing import Any, List, Optional
-from llama_index.core.embeddings import BaseEmbedding
+from langchain_core.embeddings import Embeddings
 from customer.config.config import config
 from customer.utils.logger import logger
 
 
-class DoubaoEmbeddings(BaseEmbedding):
+class DoubaoEmbeddings(Embeddings):
     """豆包嵌入模型，使用豆包API生成文本向量"""
 
     def __init__(
@@ -40,10 +40,7 @@ class DoubaoEmbeddings(BaseEmbedding):
         dims: int = 0,
         **kwargs: Any,
     ) -> None:
-        # 先调用父类初始化
-        super().__init__(**kwargs)
-
-        # 然后设置实例变量，确保不会被覆盖
+        # 设置实例变量
         self._model_name = model_name
         self._api_key = api_key
         self._base_url = base_url
@@ -113,6 +110,22 @@ class DoubaoEmbeddings(BaseEmbedding):
         """异步批量生成多个文本的嵌入向量"""
         return self._get_text_embeddings(texts)
 
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """生成文档的嵌入向量（LangChain接口）"""
+        return self._get_text_embeddings(texts)
+
+    def embed_query(self, text: str) -> List[float]:
+        """生成查询的嵌入向量（LangChain接口）"""
+        return self._get_query_embedding(text)
+
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        """异步生成文档的嵌入向量（LangChain接口）"""
+        return self.embed_documents(texts)
+
+    async def aembed_query(self, text: str) -> List[float]:
+        """异步生成查询的嵌入向量（LangChain接口）"""
+        return self.embed_query(text)
+
     def _get_doubao_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
         """批量调用豆包API生成多个文本的嵌入向量（更高效）"""
         if not texts:
@@ -158,7 +171,12 @@ class DoubaoEmbeddings(BaseEmbedding):
         return self._get_doubao_embeddings_batch(texts)
 
     @property
-    def embedding_dimensions(self) -> int:
+    def model_name(self) -> str:
+        """返回模型名称"""
+        return self._model_name
+
+    @property
+    def dims(self) -> int:
         """返回嵌入向量的维度"""
         # 豆包large模型默认是4096维
         return 4096 if self._dims == 0 else self._dims
@@ -168,7 +186,7 @@ class DoubaoEmbeddings(BaseEmbedding):
         return {
             "model_name": self._model_name,
             "provider": "Doubao",
-            "dimensions": self.embedding_dimensions,
+            "dimensions": self.dims,
             "supports_batch": True,
             "api_url": self._base_url
         }

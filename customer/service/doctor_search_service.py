@@ -26,7 +26,6 @@ Doctor search and recommendation service using LlamaIndex with hybrid retrieval.
 4. 标准医生搜索（会自动使用混合检索）：
    doctors = service.search_doctors(llm_instance, "不孕症", history, trace_id)
 """
-from math import log
 import requests
 from typing import List, Dict, Any, Optional, Generator
 import json
@@ -35,9 +34,8 @@ from customer.config.config import config
 from customer.service.embeddings import DoubaoEmbeddings
 from customer.utils.logger import logger
 from customer.utils.constants import Speeches, MessageEventStatus
-from llama_index.core import StorageContext, VectorStoreIndex
-from llama_index.core.embeddings import BaseEmbedding
-from llama_index.vector_stores.elasticsearch import ElasticsearchStore, AsyncDenseVectorStrategy
+from langchain_community.vectorstores import Milvus
+from langchain_core.vectorstores import VectorStore
 from customer.utils.tools import chunk_text, generate_msg_id
 
 def print_results(results):
@@ -49,56 +47,42 @@ def print_results(results):
 class DoctorSearchService:
     """Service for searching and recommending doctors."""
 
-    def __init__(self, entity_extractor=None, embed_model=None, index=None):
+    def __init__(self, entity_extractor=None, embed_model=None, vector_store=None):
         """
         Initialize doctor search service.
 
         Args:
             entity_extractor: Entity extraction service
-            embed_model: Embedding model for custom vector retrieval
-            index: LlamaIndex index for doctor search
+            embed_model: Embedding model for vector operations
+            vector_store: Milvus vector store instance
         """
         self.entity_extractor = entity_extractor
-        self.embed_model = embed_model
-        self.vector_store = ElasticsearchStore(
-            index_name="alpha_doctor",
-            es_url=f"http://{config.ES_HOST}:{config.ES_PORT}",
-            es_user=config.ES_USER,
-            es_password=config.ES_AUTH,
-            retrieval_strategy=AsyncDenseVectorStrategy(hybrid=True),
-            # 明确指定字段映射
-            vector_field="goodvector",
-            text_field="擅长"
+        self.embed_model = embed_model or DoubaoEmbeddings()
+
+        # Initialize Milvus vector store
+        if vector_store is None:
+            self.vector_store = Milvus(
+                embedding_function=self.embed_model,
+                collection_name="alpha_doctor",
+                connection_args={
+                    "host": config.MILVUS_HOST,
+                    "port": config.MILVUS_PORT
+                },
+                drop_old=False,
             )
+        else:
+            self.vector_store = vector_store
 
-        storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
-        self.index = VectorStoreIndex.from_vector_store(
-            vector_store=self.vector_store,
-            embed_model=embed_model,
-            storage_context=storage_context,
-        )
-
-        # 不创建 query_engine，避免依赖 OpenAI LLM
-        # self.query_engine = self.index.as_query_engine()
-        self.query_engine = None
-
-        # 初始化混合检索器 - 配置ES混合检索参数
-        self.hybrid_retriever = self.index.as_retriever(
-            similarity_top_k=10,
-            vector_store_kwargs={
-                # Elasticsearch 混合检索配置
-                "search_type": "hybrid",  # 明确指定混合搜索
-                "hybrid": True,
-                "text_field": "擅长",  # 文本字段
-                "vector_field": "goodvector",  # 向量字段
-                "num_candidates": 100,  # 候选数量
-            }
+        # Create retriever for similarity search
+        self.retriever = self.vector_store.as_retriever(
+            search_kwargs={"k": 10}
         )
 
 
     def get_full_document_by_id(self, doc_id: str) -> Dict[str, Any]:
         """
-        根据文档ID从ES获取完整的文档数据。
+        根据文档ID从外部API获取完整的文档数据。
+        注意：Milvus本身不存储完整文档数据，这里通过API获取。
 
         Args:
             doc_id: 文档ID
@@ -107,23 +91,12 @@ class DoctorSearchService:
             完整的文档数据
         """
         try:
-            es_url = f"http://{config.ES_HOST}:{config.ES_PORT}"
-            index_name = "alpha_doctor_info"
-            url = f"{es_url}/{index_name}/_doc/{doc_id}"
-
-            auth = (config.ES_USER, config.ES_AUTH)
-            response = requests.get(url, auth=auth)
-
-            if response.status_code == 200:
-                doc_data = response.json()
-                return {
-                    "_id": doc_id,
-                    "_index": index_name,
-                    **doc_data.get("_source", {}),
-                    **doc_data.get("fields", {})  # 包含fields中的数据
-                }
+            # 从外部API获取医生详情
+            doctor_details = self.get_doctor_details([int(doc_id)] if doc_id.isdigit() else [])
+            if doctor_details:
+                return doctor_details[0]
             else:
-                logger.warning(f"Failed to get document {doc_id}: {response.status_code}")
+                logger.warning(f"Failed to get document {doc_id}")
                 return {}
 
         except Exception as e:
@@ -141,46 +114,17 @@ class DoctorSearchService:
             ID到文档数据的映射
         """
         try:
-            es_url = f"http://{config.ES_HOST}:{config.ES_PORT}"
-            index_name = "alpha_doctor_info"
-            url = f"{es_url}/{index_name}/_mget"
+            # 从外部API获取医生详情
+            numeric_ids = [int(doc_id) for doc_id in doc_ids if doc_id.isdigit()]
+            doctor_details = self.get_doctor_details(numeric_ids)
 
-            auth = (config.ES_USER, config.ES_AUTH)
-            body = {"ids": doc_ids}
+            # 转换为ID映射
+            docs_map = {}
+            for detail in doctor_details:
+                doc_id = str(detail.get("id", detail.get("ID", "")))
+                docs_map[doc_id] = detail
 
-            response = requests.post(url, auth=auth, json=body)
-
-            if response.status_code == 200:
-                result = response.json()
-                docs_map = {}
-
-                for doc in result.get("docs", []):
-                    if doc.get("found"):
-                        doc_id = doc["_id"]
-                        # 合并 _source 和 fields 数据，优先使用fields中的数据（因为ES查询可能返回fields）
-                        source_data = doc.get("_source", {})
-                        fields_data = doc.get("fields", {})
-
-                        # 如果fields中有数组类型的数据，需要展开
-                        processed_fields = {}
-                        for key, value in fields_data.items():
-                            if isinstance(value, list) and len(value) == 1:
-                                processed_fields[key] = value[0]  # 展开单元素数组
-                            else:
-                                processed_fields[key] = value
-
-                        full_doc = {
-                            "_id": doc_id,
-                            "_index": index_name,
-                            **source_data,
-                            **processed_fields  # 展开后的fields数据
-                        }
-                        docs_map[doc_id] = full_doc
-
-                return docs_map
-            else:
-                logger.warning(f"Failed to batch get documents: {response.status_code}")
-                return {}
+            return docs_map
 
         except Exception as e:
             logger.error(f"Error batch getting documents: {str(e)}")
@@ -188,34 +132,33 @@ class DoctorSearchService:
 
     def hybrid_search(self, query: str, similarity_top_k: int = 10) -> List[Dict[str, Any]]:
         """
-        执行混合检索，直接返回ES文档的完整metadata信息。
+        执行向量相似度搜索，使用Milvus。
 
         Args:
             query: 搜索查询
             similarity_top_k: 返回的相似结果数量
 
         Returns:
-            ES文档的完整字段数据列表，包含所有metadata
+            检索结果列表
         """
         try:
-            logger.info(f"Performing direct ES hybrid search for query: {query}")
+            logger.info(f"Performing Milvus similarity search for query: {query}")
 
-            # 直接使用ES进行混合搜索，返回完整metadata
-            es_results = self._direct_es_hybrid_search(query, similarity_top_k)
+            # 使用Milvus进行向量相似度搜索
+            results = self._milvus_similarity_search(query, similarity_top_k)
 
-            if es_results:
-                logger.info(f"Direct ES hybrid search returned {len(es_results)} complete documents")
-                return es_results
+            if results:
+                logger.info(f"Milvus similarity search returned {len(results)} results")
+                return results
 
-            # 如果直接ES搜索失败，回退到LlamaIndex方式
-            logger.warning("Direct ES search failed, falling back to LlamaIndex retriever")
-            return self._fallback_llamaindex_search(query, similarity_top_k)
+            logger.warning("Milvus search returned no results")
+            return []
 
         except Exception as e:
-            logger.error(f"Hybrid search failed: {str(e)}")
+            logger.error(f"Milvus search failed: {str(e)}")
             import traceback
             traceback.print_exc()
-            return self._fallback_llamaindex_search(query, similarity_top_k)
+            return []
 
     def _fallback_llamaindex_search(self, query: str, similarity_top_k: int = 10) -> List[Dict[str, Any]]:
         """
@@ -260,99 +203,40 @@ class DoctorSearchService:
             logger.error(f"LlamaIndex fallback search failed: {str(e)}")
             return []
 
-    def _direct_es_hybrid_search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
+    def _milvus_similarity_search(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         """
-        直接使用ES API进行混合搜索，返回完整的文档metadata。
+        使用Milvus进行向量相似度搜索。
 
         Args:
             query: 搜索查询
             limit: 返回结果数量
 
         Returns:
-            包含所有ES文档字段的完整数据列表
+            检索结果列表
         """
         try:
-            es_url = f"http://{config.ES_HOST}:{config.ES_PORT}"
-            index_name = "alpha_doctor"
-            search_url = f"{es_url}/{index_name}/_search"
+            logger.info(f"Milvus similarity search with query: '{query}'")
 
-            # 获取查询向量
-            query_vector = self.embed_model.get_text_embedding(query)
-            logger.info(f"Query vector dimension: {len(query_vector)}")
+            # 使用LangChain的Milvus向量存储进行相似度搜索
+            docs_and_scores = self.vector_store.similarity_search_with_score(query, k=limit)
 
-            # 构建混合查询：结合文本搜索和向量搜索
-            search_body = {
-                "size": limit,
-                "query": {
-                    "bool": {
-                        "should": [
-                            # 文本搜索 - 在多个字段中搜索
-                            {
-                                "multi_match": {
-                                    "query": query,
-                                    "fields": ["擅长^2", "姓名"],
-                                    "type": "best_fields",
-                                    "boost": 1.5
-                                }
-                            },
-                            # 向量搜索 - 余弦相似度
-                            {
-                                "script_score": {
-                                    "query": {
-                                        "exists": {"field": "goodvector"}
-                                    },
-                                    "script": {
-                                        "source": """
-                                            double similarity = cosineSimilarity(params.query_vector, 'goodvector');
-                                            return similarity > 0 ? similarity : 0;
-                                        """,
-                                        "params": {
-                                            "query_vector": query_vector
-                                        }
-                                    },
-                                    "boost": 2.0
-                                }
-                            }
-                        ],
-                        "minimum_should_match": 1
-                    }
-                },
-                "sort": [
-                    {"_score": {"order": "desc"}}
-                ],
-                "_source": True  # 返回所有字段
-            }
+            logger.info(f"Milvus similarity search returned {len(docs_and_scores)} results")
 
-            logger.info(f"Direct ES hybrid search with query: '{query}'")
-            response = requests.post(search_url, auth=(config.ES_USER, config.ES_AUTH), json=search_body)
+            # 转换结果格式
+            results = []
+            for doc, score in docs_and_scores:
+                doc_data = doc.metadata.copy()
+                doc_data['content'] = doc.page_content
+                doc_data['score'] = score
+                doc_data['retrieval_method'] = 'milvus_similarity'
+                doc_data['query'] = query
 
-            if response.status_code == 200:
-                data = response.json()
-                hits = data.get('hits', {}).get('hits', [])
+                results.append(doc_data)
 
-                logger.info(f"Direct ES hybrid search returned {len(hits)} results")
-
-                # 直接返回ES文档的完整数据
-                results = []
-                for hit in hits:
-                    doc_data = hit['_source']
-                    # 添加ES特有的字段
-                    doc_data['_id'] = hit['_id']
-                    doc_data['_index'] = hit['_index']
-                    doc_data['_score'] = hit['_score']
-                    # 添加一些额外的检索信息
-                    doc_data['retrieval_method'] = 'direct_es_hybrid'
-                    doc_data['query'] = query
-
-                    results.append(doc_data)
-
-                return results
-            else:
-                logger.error(f"Direct ES hybrid search failed: {response.status_code}, {response.text}")
-                return []
+            return results
 
         except Exception as e:
-            logger.error(f"Direct ES hybrid search error: {str(e)}")
+            logger.error(f"Milvus similarity search error: {str(e)}")
             import traceback
             traceback.print_exc()
             return []
